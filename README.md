@@ -1,6 +1,6 @@
-# Flowbase — MVP low-code/no-code
+# Flowbase — Low-code CRM & Process Studio 0.2
 
-Implementasi fungsional tahap awal dari PRD v0.1. Bahasa UI: Indonesia. Produk referensi: kategori platform low-code/no-code seperti Creatio, bukan replika fitur enterprise.
+Implementasi fungsional dari PRD v0.1 dengan perluasan Studio 0.2. Lihat `docs-studio-guide.md` untuk panduan workflow/page designer dan batas kompatibilitas Camunda/Creatio. Bahasa UI: Indonesia. Produk referensi: kategori platform low-code/no-code seperti Creatio, bukan replika fitur enterprise.
 
 ## Yang sudah berjalan
 
@@ -14,7 +14,10 @@ Implementasi fungsional tahap awal dari PRD v0.1. Bahasa UI: Indonesia. Produk r
 - Draft/publish: revision optimistic, snapshot published immutable, kompatibilitas tipe/key, dan backfill required field dengan default.
 - Runtime CRUD: validasi server, relasi FK, owner, optimistic revision, dan soft-delete dengan pemeriksaan reference/workflow aktif.
 - Permission member per entity/action: none, own, all; create boolean. Akses baca/ubah/hapus diterapkan API.
-- Workflow template diskon: manual submit, threshold konfigurabel, satu approver, approve/reject, reassign, hasil dan notifikasi.
+- Process modeler graf: start/end, exclusive gateway, beberapa user task berurutan, data task, notifikasi, dan timer; trigger manual/record-created; undo/redo, fullscreen, simulasi dan import/export JSON.
+- Workflow engine monitor: instance, execution trace, task/decision variables, incident, cancel, retry node gagal, revision conflict, dan pinned version.
+- Page designer: sections, judul/deskripsi, full-width, placeholder/help text, conditional visibility, dan preview interaktif.
+- Data rules serta versi aplikasi: constraint field, inspect snapshot, dan restore-to-draft.
 - Transactional outbox, idempotency key submit, revision conflict detection, retry backoff + jitter maksimum lima kali, dan dead-letter.
 - Audit append-only pada role database runtime dan notifikasi hanya untuk penerima.
 - Data pada disk, bukan localStorage. Data tetap tersedia setelah database dibuka ulang selama direktori datanya dipertahankan.
@@ -38,11 +41,15 @@ Persona terbuka ini sengaja untuk uji demo. Siapa pun yang memiliki akses previe
 - Worker polling single-instance berada dalam proses server. Semua akses PGlite aplikasi diserialkan untuk menjaga konteks transaksi.
 - `server/schema.sql`: fondasi 12 tabel dari rancangan awal.
 - `server/index.js`: seed, API, authorization, validasi, publish dan worker.
-- `server/test.js`: 55 assertion integrasi dalam database sementara terisolasi.
+- `server/test.js` + `server/graph-test.js`: 103 assertion integrasi dalam database sementara terisolasi.
+- `server/workflow-engine.js`: eksekusi per-node dan command instance.
+- `src/WorkflowStudio.jsx`: React Flow modeler dan process operations.
+- `src/DesignStudio.jsx`: page sections, visibility, data rules dan version history.
+- `src/shared/workflow.js`: metadata graph, type validation dan simulasi.
 - `src/main.jsx`: UI dan builder metadata.
 - `src/styles.css`: desain navy/teal, responsive layout, dan dukungan reduced motion.
 
-Form drag-and-drop memakai HTML drag events dan tombol alternatif. Diagram workflow adalah visualisasi template konfigurabel, bukan editor BPMN atau graf bebas. Stack ini sengaja lebih ringan daripada NestJS + React Flow pada rancangan awal, agar fungsi inti segera dapat dicoba.
+Form drag-and-drop memakai HTML drag events dan tombol alternatif. Process modeler menggunakan React Flow dan graf executable Flowbase JSON. Bukan editor/engine BPMN 2.0 kompatibel Camunda; impor/ekspor BPMN XML belum tersedia. Stack ini sengaja lebih ringan daripada NestJS + React Flow pada rancangan awal, agar fungsi inti segera dapat dicoba.
 
 ## Pengembangan di lingkungan sendiri
 
@@ -69,9 +76,9 @@ Untuk container, Dockerfile tersedia; mount volume persisten pada `/data`. Conta
 | Pengelolaan tenant/member | Dua tenant dan tiga anggota seeded; belum UI provisioning, undangan, nonaktifkan membership, atau transfer owner. Membership aktif tetap diverifikasi setiap request. |
 | Database | PGlite single-instance. Migrasi ke PostgreSQL 16+ server dan pool transaksi diperlukan untuk SaaS/pilot multi-instance. |
 | List / kapasitas | Bootstrap maksimum 1.000 record per app, pagination 10 per halaman di client, search text dan filter status; belum query range, saved filters, atau pagination server. Dashboard hanya agregasi record bootstrap yang dapat dibaca, bukan seluruh dataset besar. |
-| Workflow | Satu template diskon per app, manual submit; belum graf arbitrary, record-created trigger generik, parallel branch, escalation, atau scheduler. |
+| Workflow | Graph tanpa siklus; trigger manual/record-created; user task berurutan; timer/outbox. Belum BPMN XML, parallel branch/join, loop, subprocess, external connector atau escalation. |
 | Publish | Backfill kecil dalam transaksi tunggal, write serial per instance. Belum job migrasi besar, distributed lock, atau rollback konfigurasi otomatis. |
-| Error/conflict recovery | Run conflict/failed terlihat; admin dapat meninjau lalu submit ulang dengan key baru. Belum console replay/dead-letter operator atau cancellation UI. |
+| Error/conflict recovery | Cancel dan retry failed node tersedia; conflict memerlukan pengajuan ulang dan tidak boleh bypass revision. Belum advanced process migration/compensation dan distributed dead-letter console. |
 | Dashboard | Widget CRM tetap, mata uang awal IDR; belum dashboard builder, pelaporan lintas currency, dan agregasi server skala besar. |
 | Integrasi | Belum email bisnis, webhook eksternal, API token publik, lampiran, import/export CSV, atau file storage. |
 | Operasional | Belum backup/PITR otomatis, restore drill, telemetry platform, alert, SLA, security audit, atau uji beban target PRD. |

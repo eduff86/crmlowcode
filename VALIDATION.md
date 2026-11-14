@@ -2,7 +2,7 @@
 
 Status build: **lulus**. `npm run build` menghasilkan bundle React/Vite production. Dependency audit saat instalasi: tidak ada vulnerability yang dilaporkan npm pada dependency snapshot ini; bukan penetration test.
 
-Status integrasi: **55 assertion lulus** melalui `npm test`. Database sementara di filesystem terpisah, lalu dihapus setelah uji.
+Status integrasi: **103 assertion lulus** (55 regression + 48 graph/studio) melalui `npm test`. Database sementara di filesystem terpisah, lalu dihapus setelah uji.
 
 Cakupan: seed CRM; metadata runtime; scope own; pembatasan draft/audit member; isolasi tenant/API/reference; header write; validasi uang/system-managed; CRUD; optimistic conflict; idempotent submit; worker approval; notifikasi; non-assignee denial; alasan reject; duplicate decision; approval/auto-approval; stale record conflict; reference delete restriction; draft revision; draft/live separation; publish version/backfill; breaking type rejection; entity custom; UUID validation; inbox recipient; reassignment; rejection; role SQL untuk identity/audit/RLS; lima retry dan dead-letter; persistence setelah database dibuka ulang.
 
@@ -21,3 +21,7 @@ Alur browser diuji dengan Playwright:
 Bug yang ditemukan dan diperbaiki saat verifikasi: bootstrap sesi demo ganda; interaksi RLS recipient dengan dedupe notification insert; serta filter pencarian yang terbawa saat berpindah entitas.
 
 Build/test ini tidak membuktikan keamanan produksi, SLA, target beban PRD, restore backup, audit WCAG, crash recovery hard-kill, atau kompatibilitas deployment PostgreSQL server multi-instance.
+
+## Verifikasi Studio 0.2
+
+Graph engine, serial approval, typed data task, exclusive branches, timer recovery, record-created trigger, incident/retry/cancel, conflict guard, pinned version, page sections/visibility, version restore, dan UI handle connection diuji. Rincian tersedia pada `docs-studio-guide.md`. Build React Flow berhasil; bundler melaporkan advisory chunk size dan mengabaikan directive use client pada library, bukan kegagalan build.
