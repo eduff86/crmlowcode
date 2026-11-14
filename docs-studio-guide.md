@@ -74,3 +74,7 @@ Worker tetap single-instance dalam proses Node.js/PGlite. Belum distributed work
 Playwright: create/publish proses generic Lead, simulasi, configure page sections/help text/visibility, preview visibility new→qualified, start instance dari record, approve melalui persona Maya, instance completed di monitor, tambah timer dan hubungkan handles dengan mouse, validate/publish model, fullscreen dan mobile viewport 390×844.
 
 Belum load test kapasitas PRD, pentest, audit WCAG formal, backup/PITR drill, distribusi multi-instance, atau uji crash hard-kill pada tiap titik commit. Gunakan data contoh saja; demo personas masih terbuka.
+
+## Mode demo GitHub Pages
+
+Fitur yang sama dapat dicoba tanpa backend hosting. Engine dan PostgreSQL berjalan di browser melalui Web Worker; data tersimpan dalam IndexedDB per origin/browser. Tidak ada akun produksi, cloud sync, shared database, atau background workflow saat tab ditutup. Timer yang jatuh tempo dilanjutkan saat dibuka kembali. Tampilan banner selalu menunjukkan batas mode ini. Mode server tetap memakai Express dan data directory.

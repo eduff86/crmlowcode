@@ -6,7 +6,8 @@
   "scripts": {
     "build": "vite build",
     "start": "node server/index.js",
-    "test": "node server/test.js && node server/graph-test.js"
+    "test": "node server/test.js && node server/graph-test.js && node server/browser-test.js",
+    "build:pages": "DEMO_BROWSER=1 vite build"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.14",

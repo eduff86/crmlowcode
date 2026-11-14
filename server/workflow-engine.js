@@ -1,4 +1,4 @@
-import {randomUUID} from 'node:crypto';
+const randomUUID = () => globalThis.crypto.randomUUID();
 import {validateGraph,evaluateCondition,nextNode,valueError} from '../src/shared/workflow.js';
 export function createWorkflowEngine({endpoint,qrow,appData,loadRecord,can,member,notify,audit,fail}){
  async function assignees(t,s,w,definition,record){

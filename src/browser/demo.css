@@ -1,0 +1,1 @@
+.demo-banner{display:flex;align-items:center;gap:14px;padding:10px 24px;background:#eaf6ff;border-bottom:1px solid #cce4f5;color:#164565;font-size:12px;line-height:1.5;flex-shrink:0}.demo-banner strong{white-space:nowrap}.demo-banner span{color:#47657b}@media(max-width:700px){.demo-banner{align-items:flex-start;flex-direction:column;gap:2px;padding:10px 16px}}

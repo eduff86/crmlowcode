@@ -2,6 +2,18 @@
 
 Implementasi fungsional dari PRD v0.1 dengan perluasan Studio 0.2. Lihat `docs-studio-guide.md` untuk panduan workflow/page designer dan batas kompatibilitas Camunda/Creatio. Bahasa UI: Indonesia. Produk referensi: kategori platform low-code/no-code seperti Creatio, bukan replika fitur enterprise.
 
+## Demo online gratis — GitHub Pages
+
+Mode demo browser tersedia di **https://eduff86.github.io/crmlowcode/** setelah GitHub Actions berhasil melakukan deployment. `npm run build:pages` menghasilkan `dist-pages/` dengan base path repository, worker lokal, WASM dan data bundle PostgreSQL. Workflow `.github/workflows/pages.yml` menjalankan tests/build dan deploy setiap push ke main. Mode Node.js/Express tetap tersedia melalui build/start biasa.
+
+- Tidak memerlukan VPS, layanan backend, API key atau langganan hosting.
+- Database PostgreSQL WASM berjalan di Web Worker dan disimpan dalam IndexedDB **browser pengunjung sendiri**. Tidak ada server database cloud, sinkronisasi perangkat atau kolaborasi antar-pengguna.
+- CRUD, Studio, graph workflow, approvals dengan ganti persona, notifications dan versioning dapat dicoba lokal. Persona bukan autentikasi produksi; aturan role/RLS hanya mendemonstrasikan logika aplikasi, bukan melindungi data dari pemilik browser.
+- Timer diproses saat worker tab berjalan; jika tab ditutup, event yang jatuh tempo dilanjutkan ketika aplikasi dibuka kembali. Tidak ada layanan background 24/7.
+- Reload mempertahankan data pada origin/browser yang sama. Browser lain, mode private, hapus data situs, eviction storage, atau pindah domain tidak mempertahankan workspace tersebut. Ini bukan backup.
+- Gunakan satu tab aktif; Web Locks mencegah dua worker mengakses database yang sama. Browser harus mendukung WebAssembly, IndexedDB, Web Workers dan Web Locks.
+- Pembukaan pertama mengunduh bundle database sekitar 14 MB sebelum kompresi, sehingga dapat lebih lambat. Hanya gunakan data contoh. Batas dan ketersediaan hosting mengikuti layanan GitHub Pages; bukan SLA produksi.
+
 ## Yang sudah berjalan
 
 - React UI responsif: ringkasan, CRM, daftar/board opportunity, inbox approval, studio, aplikasi, dan audit.
@@ -20,7 +32,7 @@ Implementasi fungsional dari PRD v0.1 dengan perluasan Studio 0.2. Lihat `docs-s
 - Data rules serta versi aplikasi: constraint field, inspect snapshot, dan restore-to-draft.
 - Transactional outbox, idempotency key submit, revision conflict detection, retry backoff + jitter maksimum lima kali, dan dead-letter.
 - Audit append-only pada role database runtime dan notifikasi hanya untuk penerima.
-- Data pada disk, bukan localStorage. Data tetap tersedia setelah database dibuka ulang selama direktori datanya dipertahankan.
+- Pada mode server, data pada disk, bukan localStorage. Data tetap tersedia setelah database dibuka ulang selama direktori datanya dipertahankan.
 
 ## Cara mencoba di preview
 
@@ -38,7 +50,7 @@ Persona terbuka ini sengaja untuk uji demo. Siapa pun yang memiliki akses previe
 
 - Node.js 22+, Express 5, React 19, Vite 6, Lucide icons.
 - PGlite/PostgreSQL embedded pada filesystem: SQL relasional dan RLS nyata, bukan database produksi PostgreSQL multi-proses.
-- Worker polling single-instance berada dalam proses server. Semua akses PGlite aplikasi diserialkan untuk menjaga konteks transaksi.
+- Pada mode server, worker polling single-instance berada dalam proses server. Semua akses PGlite aplikasi diserialkan untuk menjaga konteks transaksi.
 - `server/schema.sql`: fondasi 12 tabel dari rancangan awal.
 - `server/index.js`: seed, API, authorization, validasi, publish dan worker.
 - `server/test.js` + `server/graph-test.js`: 103 assertion integrasi dalam database sementara terisolasi.
