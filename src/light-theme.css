@@ -1,0 +1,11 @@
+:root{color-scheme:light;background:#f8fafb;--navy:#fdfefe;--muted:#657c88;--border:#e0e8ec}
+.sidebar{background:#fff;border-right:1px solid #e0e8ec;color:#536d79}
+.brand{color:#193c48}.brandmark{background:#eaf7f1;border-color:#c6e5d9;color:#16836c}.brand-dot{color:#149a7d}
+.workspace-switch{background:#f5f9f8;border-color:#ddebe5}.workspace-avatar{background:#e4f2eb;border-color:#c5dfd0;color:#39785d}.workspace-avatar span{background:#e4f2eb;color:#39785d}.workspace-caption{color:#718a95}.workspace-switch select{color:#294e5c}.sidebar select option{background:#fff;color:#294e5c}
+.nav-section{color:#6a818d}.app-select{color:#478b77}.app-select select{color:#345867}
+.sidebar nav button{color:#526e7b}.sidebar nav button:hover{background:#f0f7f4;color:#236d59}.sidebar nav button.active{background:#e8f5ee;color:#176f55}.sidebar nav button.active:before{background:#39a77e}.sidebar nav button.active svg{color:#258664}
+.nav-count{background:#edf2f5;color:#627b88}.active .nav-count{background:#d0eadc;color:#39745b}.nav-count.amber{background:#fff2d4;color:#9b761e}.nav-rule{background:#e3ecef}.mini-label{border-color:#d8e6df;color:#648879;background:#f6faf7}
+.workspace-health{color:#648578}.workspace-health svg{color:#739888}.profile{background:#f9fbfa;color:#365766;border-color:#e0eae6}.profile .avatar{background:#e5f2eb;color:#437b5c;border-color:#cddfd1}.profile small{color:#768e9a}
+.topbar{background:#fff}.main-shell{background:#f8fafb}.main-footer{background:#fbfcfd;color:#748994}
+.toast{background:#effaf4;color:#286748;border:1px solid #bfdfcc;box-shadow:0 5px 25px #52745f20}.toast button{color:#6a9580}
+.stat-label,.page-heading p,.panel-header p{color:#687f8c}.stat-bottom,.stage-caption{color:#718792}.record-title small{color:#778e9a}.muted{color:#6f8591}.breadcrumbs{color:#708590}.sidebar .status-dot{background:#32a27c}

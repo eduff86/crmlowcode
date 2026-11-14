@@ -1,0 +1,199 @@
+import express from 'express';
+import {PGlite} from '@electric-sql/pglite';
+import {randomUUID} from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const uid = n => `00000000-0000-0000-0000-${String(n).padStart(12,'0')}`;
+const personas = [
+  {id:uid(3),name:'Edvan Santana',role:'owner',title:'Workspace owner',initials:'ES'},
+  {id:uid(4),name:'Maya Putri',role:'admin',title:'Sales manager · Approver',initials:'MP'},
+  {id:uid(5),name:'Rafi Pratama',role:'member',title:'Sales executive',initials:'RP'}
+];
+const fail = (message,status=422) => {const error = new Error(message);error.status=status;throw error;};
+const keyPattern = /^[a-z][a-z0-9_]{0,62}$/;
+const fields = (list)=>list.map(([key,label,type,extra={}])=>({key,label,type,...extra}));
+export function template() {
+ const entities = [
+  {key:'account',label:'Perusahaan',icon:'Building2',fields:fields([['name','Nama perusahaan','text',{required:true,searchable:true}],['industry','Industri','enum',{options:['Teknologi','Manufaktur','Retail','Jasa','Kesehatan']}],['website','Website','text']])},
+  {key:'contact',label:'Kontak',icon:'Users',fields:fields([['name','Nama lengkap','text',{required:true,searchable:true}],['email','Email','email'],['phone','Telepon','text'],['account','Perusahaan','reference',{targetEntity:'account'}]])},
+  {key:'lead',label:'Lead',icon:'Target',fields:fields([['name','Nama lead','text',{required:true,searchable:true}],['email','Email','email'],['company','Perusahaan','text'],['source','Sumber','enum',{options:['Website','Referral','Event','Outbound']}],['status','Status','enum',{options:['new','qualified','disqualified'],default:'new'}]])},
+  {key:'opportunity',label:'Opportunity',icon:'BriefcaseBusiness',fields:fields([['name','Nama opportunity','text',{required:true,searchable:true}],['account','Perusahaan','reference',{targetEntity:'account',required:true}],['amount','Nilai penawaran','decimal',{min:'0',default:'0'}],['currency','Mata uang','enum',{options:['IDR'],default:'IDR'}],['stage','Tahap pipeline','enum',{options:['draft','qualification','proposal','negotiation','won','lost'],default:'qualification'}],['close_date','Target closing','date'],['discount_percent','Diskon (%)','decimal',{min:'0',max:'100',default:'0'}],['discount_status','Status persetujuan','enum',{options:['none','pending','approved','rejected'],default:'none',systemManaged:true}]])}
+ ];
+ return {schemaFormat:1,entities,forms:entities.map(e=>({key:e.key+'_main',entity:e.key,columns:2,fields:e.fields.map(f=>f.key)})),views:entities.map(e=>({key:e.key+'_list',entity:e.key,columns:e.fields.slice(0,5).map(f=>f.key)})),permissions:entities.map(e=>({role:'member',entity:e.key,read:['account','contact'].includes(e.key)?'all':'own',create:true,update:'own',delete:'none'})),workflows:[{key:'discount_approval',entity:'opportunity',label:'Persetujuan diskon',trigger:'manual_submit',threshold:'10',assigneeId:uid(4),enabled:true}],dashboard:{template:'crm_default'}};
+}
+
+export async function createServer({dataDir = process.env.DATA_DIR || '/tmp/flowbase-mvp-data',seed=true}={}) {
+ const db = new PGlite(dataDir);
+ let queue = Promise.resolve();
+ const serial = (fn)=> {const p=queue.then(fn);queue=p.catch(()=>{});return p;};
+ const existing=await db.query("SELECT to_regclass('public.tenants') AS t");
+ if(!existing.rows[0].t) {
+  await db.exec(await fs.readFile(path.join(root,'server/schema.sql'),'utf8'));
+  await db.exec(`CREATE ROLE app_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS;
+  GRANT USAGE ON SCHEMA public TO app_runtime;
+  GRANT EXECUTE ON FUNCTION context_tenant(),context_user() TO app_runtime;
+  GRANT SELECT ON tenants,memberships,apps,app_versions,records,record_links,workflow_runs,approval_tasks,notifications,outbox_events,audit_events TO app_runtime;
+  GRANT INSERT,UPDATE ON memberships,apps,app_versions,records,workflow_runs,approval_tasks,outbox_events TO app_runtime;
+  GRANT INSERT,UPDATE,DELETE ON record_links TO app_runtime;
+  GRANT INSERT ON notifications,audit_events TO app_runtime;
+  GRANT UPDATE(read_at) ON notifications TO app_runtime;`);
+  if(seed) await seedDemo(db);
+ }
+ const app=express(); app.disable('x-powered-by');app.use(express.json({limit:'1mb'}));
+ app.use((req,res,next)=>{res.set('X-Content-Type-Options','nosniff');res.set('Referrer-Policy','same-origin');req.requestId=randomUUID();next();});
+ const sessions=new Map(),requestRates=new Map();
+ const tx = (session,fn)=>db.transaction(async t=>{
+  await t.exec('SET LOCAL ROLE app_runtime');
+  await t.query("SELECT set_config('app.tenant_id',$1,true),set_config('app.user_id',$2,true)",[session.tenantId,session.userId]);
+  return fn(t);
+ });
+ const getMembership = async(s)=>{
+  const q=await db.query(`SELECT m.role FROM memberships m JOIN tenants t ON t.id=m.tenant_id WHERE m.tenant_id=$1 AND m.user_id=$2 AND m.status='active' AND t.status='active'`,[s.tenantId,s.userId]);
+  if(!q.rows.length) fail('Membership perusahaan tidak aktif.',403); return q.rows[0].role;
+ };
+ function setSession(res,userId,tenantId){const token=randomUUID();sessions.set(token,{userId,tenantId,expires:Date.now()+86400000});res.cookie('flowbase_session',token,{httpOnly:true,sameSite:'lax',maxAge:86400000,path:'/'});return sessions.get(token);}
+ app.use('/api', (req,res,next)=>{
+  if(req.method!=='GET' && req.get('x-flowbase-client')!=='web') return res.status(403).json({message:'Header klien wajib.',requestId:req.requestId});
+  const cookie=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('flowbase_session='))?.split('=')[1];
+  req.session=sessions.get(cookie);
+  const rateKey=cookie||req.ip;const rate=requestRates.get(rateKey)||{start:Date.now(),count:0};if(Date.now()-rate.start>60000){rate.start=Date.now();rate.count=0;}rate.count++;requestRates.set(rateKey,rate);if(rate.count>300)return res.status(429).json({message:'Terlalu banyak permintaan. Tunggu satu menit.',requestId:req.requestId});
+  if(requestRates.size>1000)for(const [key,value]of requestRates)if(Date.now()-value.start>60000)requestRates.delete(key);
+  if(sessions.size>1000)for(const [key,value]of sessions)if(value.expires<Date.now())sessions.delete(key);
+  if(req.session?.expires<Date.now()) req.session=null;
+  if(!req.session && req.method==='GET' && req.path==='/state') req.session=setSession(res,uid(3),uid(1));
+  if(!req.session && req.path!=='/demo-session') return res.status(401).json({message:'Buka workspace demo terlebih dahulu.',requestId:req.requestId});
+  next();
+ });
+ function endpoint(method,url,handler){app[method](url,(req,res,next)=>serial(async()=>{
+  const role=await getMembership(req.session);req.session.role=role;
+  for(const value of Object.values(req.params))if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value))fail('ID resource tidak valid.');
+  if(req.query.app&&!/^[0-9a-f-]{36}$/i.test(req.query.app))fail('ID aplikasi tidak valid.');
+  const result=await tx(req.session,t=>handler(t,req,req.session));
+  if(!res.headersSent) res.json(result??{ok:true});
+ }).catch(next));}
+ const qrow=async(t,sql,params=[]) => (await t.query(sql,params)).rows[0];
+ const audit=async(t,s,action,type,id,changes={},requestId='worker')=>t.query(`INSERT INTO audit_events(tenant_id,actor_id,action,resource_type,resource_id,changes,request_id) VALUES ($1,$2,$3,$4,$5,$6,$7)`,[s.tenantId,s.userId,action,type,id,JSON.stringify(changes),requestId]);
+ async function appData(t,s,id){let a=id?await qrow(t,'SELECT * FROM apps WHERE id=$1',[id]):await qrow(t,'SELECT * FROM apps ORDER BY created_at LIMIT 1');if(!a) fail('Aplikasi tidak ditemukan.',404);
+  const v=a.current_version_id?await qrow(t,"SELECT * FROM app_versions WHERE id=$1 AND status='published'",[a.current_version_id]):null;
+  const draft=s.role!=='member'?await qrow(t,"SELECT * FROM app_versions WHERE app_id=$1 AND status='draft'",[a.id]):null;return {a,v,draft};
+ }
+ function scope(s,d,e,action){if(s.role!=='member') return action==='create'?true:'all';return d.permissions?.find(p=>p.entity===e)?.[action]??(action==='create'?false:'none');}
+ function can(s,d,r,action){const p=scope(s,d,r.entity_key,action);return p==='all'||(p==='own'&&r.owner_id===s.userId);}
+ async function loadRecord(t,s,id,action='read'){const r=await qrow(t,'SELECT * FROM records WHERE id=$1 AND deleted_at IS NULL',[id]);if(!r) fail('Record tidak ditemukan.',404);const data=await appData(t,s,r.app_id);if(!data.v||!can(s,data.v.definition,r,action)) fail('Record tidak ditemukan atau akses tidak tersedia.',404);return {...data,r};}
+ async function notify(t,s,recipient,type,payload,dedupe){const context=await qrow(t,'SELECT context_user() AS user_id');await t.query("SELECT set_config('app.user_id',$1,true)",[recipient]);await t.query(`INSERT INTO notifications(tenant_id,recipient_id,type,payload,dedupe_key) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,dedupe_key) DO NOTHING`,[s.tenantId,recipient,type,JSON.stringify(payload),dedupe]);await t.query("SELECT set_config('app.user_id',$1,true)",[context.user_id]);}
+ async function member(t,s,id){const row=await qrow(t,"SELECT * FROM memberships WHERE user_id=$1 AND status='active'",[id]);if(!row)fail('Anggota tujuan tidak aktif.',422);return row;}
+ async function validate(t,s,d,entity,data,references,old=null){const e=d.entities.find(e=>e.key===entity);if(!e) fail('Entitas tidak ditemukan.',404);if(JSON.stringify(data).length>65536)fail('Ukuran record maksimum 64 KB.');const clean={},refs={};
+  for(const key of Object.keys(data)) {const f=e.fields.find(f=>f.key===key);if(!f||f.type==='reference')fail(`Field ${key} tidak dikenali.`);if(f.systemManaged)fail(`Field ${f.label} hanya dapat diubah workflow.`);}
+  for(const key of Object.keys(references||{}))if(!e.fields.find(f=>f.key===key&&f.type==='reference'))fail(`Referensi ${key} tidak valid.`);
+  for(const f of e.fields){if(f.systemManaged){clean[f.key]=old?.[f.key]??f.default??null;continue;}let value=f.type==='reference'?references?.[f.key]:data[f.key];if(value===undefined && f.type!=='reference')value=f.default??null;
+   if(value===''||value===null||value===undefined){if(f.required)fail(`${f.label} wajib diisi.`);if(f.type!=='reference')clean[f.key]=null;continue;}
+   if(f.type==='reference'){const target=await loadRecord(t,s,value);if(target.r.app_id!==d._appId||target.r.entity_key!==f.targetEntity)fail(`Target ${f.label} tidak sesuai.`);refs[f.key]=value;continue;}
+   if(f.type==='boolean'){if(typeof value!=='boolean')fail(`${f.label} harus benar/salah.`);}
+   else if(f.type==='decimal'||f.type==='integer'){if(!/^-?\d+(\.\d{1,2})?$/.test(String(value)))fail(`${f.label} harus berupa angka, maksimal dua desimal.`);if(f.type==='integer'&&!Number.isSafeInteger(Number(value)))fail(`${f.label} harus bilangan bulat aman.`);if(!Number.isFinite(Number(value))||(f.min!=null&&Number(value)<Number(f.min))||(f.max!=null&&Number(value)>Number(f.max)))fail(`${f.label} di luar rentang yang diizinkan.`);if(String(value).replace(/[-.]/g,'').length>18)fail(`${f.label} maksimum 18 digit.`);value=f.type==='integer'?Number(value):String(value);}
+   else {if(typeof value!=='string')fail(`${f.label} harus berupa teks.`);if(value.length>(f.maxLength||1000))fail(`${f.label} terlalu panjang.`);if(f.type==='email'&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))fail(`${f.label} bukan email valid.`);if(f.type==='enum'&&!f.options?.includes(value))fail(`${f.label} tidak ada dalam pilihan.`);if(f.type==='date'&&(!/^\d{4}-\d{2}-\d{2}$/.test(value)||!Number.isFinite(Date.parse(value))||new Date(value).toISOString().slice(0,10)!==value))fail(`${f.label} bukan tanggal valid.`);if(f.type==='datetime'&&!Number.isFinite(Date.parse(value)))fail(`${f.label} bukan waktu valid.`);}
+   clean[f.key]=value;
+  }
+  return {clean,refs};
+ }
+ async function saveLinks(t,s,appId,id,refs){await t.query('DELETE FROM record_links WHERE source_record_id=$1',[id]);for(const [key,target]of Object.entries(refs))await t.query('INSERT INTO record_links VALUES ($1,$2,$3,$4,$5)',[s.tenantId,appId,id,key,target]);}
+
+ app.post('/api/demo-session',(req,res,next)=>serial(async()=>{const {userId,tenantId}=req.body;if(!personas.some(p=>p.id===userId)||![uid(1),uid(2)].includes(tenantId))fail('Persona demo tidak valid.');await getMembership({userId,tenantId});setSession(res,userId,tenantId);res.json({ok:true});}).catch(next));
+ endpoint('get','/api/state',async(t,req,s)=>{
+  const allApps=(await t.query('SELECT * FROM apps ORDER BY created_at')).rows;
+  const {a,v,draft}=await appData(t,s,req.query.app);
+  const definition=v?.definition??{entities:[],forms:[],workflows:[],permissions:[]};
+  const raw=(await t.query('SELECT * FROM records WHERE app_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1000',[a.id])).rows;
+  const visible=raw.filter(r=>can(s,definition,r,'read'));
+  const links=(await t.query('SELECT * FROM record_links WHERE app_id=$1',[a.id])).rows;
+  const records=visible.map(r=>({...r,references:Object.fromEntries(links.filter(l=>l.source_record_id===r.id).map(l=>[l.field_key,l.target_record_id]))}));
+  const approvals=(await t.query(`SELECT p.*,w.record_id,w.app_id,w.context,w.status AS run_status FROM approval_tasks p JOIN workflow_runs w ON w.tenant_id=p.tenant_id AND w.id=p.run_id WHERE p.assignee_id=$1 ORDER BY p.created_at DESC LIMIT 100`,[s.userId])).rows.filter(p=>p.app_id===a.id && visible.some(r=>r.id===p.record_id));
+  const runs=(await t.query('SELECT * FROM workflow_runs WHERE app_id=$1 ORDER BY created_at DESC LIMIT 100',[a.id])).rows.filter(w=>visible.some(r=>r.id===w.record_id));
+  const notifications=(await t.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 30')).rows;
+  const members=(await t.query("SELECT user_id,role FROM memberships WHERE status='active'")).rows.map(m=>({...m,...personas.find(p=>p.id===m.user_id)}));
+  const logs=s.role==='member'?[]:(await t.query('SELECT * FROM audit_events ORDER BY created_at DESC LIMIT 30')).rows;
+  return {session:{...s,...personas.find(p=>p.id===s.userId)},tenant:await qrow(t,'SELECT * FROM tenants'),personas,tenants:[{id:uid(1),name:'Nusantara Digital',short:'ND'},{id:uid(2),name:'Atlas Workspace',short:'AW'}],apps:allApps,app:a,version:v,draft,definition,records,approvals,runs,notifications,members,audit:logs,demo:true,recordLimit:1000};
+ });
+ endpoint('post','/api/apps',async(t,req,s)=>{if(s.role==='member')fail('Hanya admin dapat membuat aplikasi.',403);const name=String(req.body.name||'').trim();if(!name||name.length>100)fail('Nama aplikasi wajib, maksimal 100 karakter.');const id=randomUUID(),key='app_'+id.replaceAll('-','').slice(0,12);await t.query('INSERT INTO apps(tenant_id,id,key,name) VALUES ($1,$2,$3,$4)',[s.tenantId,id,key,name]);const d=req.body.template==='blank'?{schemaFormat:1,entities:[],forms:[],views:[],permissions:[],workflows:[],dashboard:{template:'crm_default'}}:template();await t.query('INSERT INTO app_versions(tenant_id,app_id,version_no,created_by,definition) VALUES ($1,$2,1,$3,$4)',[s.tenantId,id,s.userId,JSON.stringify(d)]);await audit(t,s,'app.created','app',id,{},req.requestId);return {id};});
+ endpoint('put','/api/apps/:id/draft',async(t,req,s)=>{if(s.role==='member')fail('Hanya admin dapat membuka Studio.',403);const {draft}=await appData(t,s,req.params.id);if(!draft||draft.revision!==req.body.revision)fail('Draft telah berubah. Muat ulang sebelum menyimpan.',409);const d=req.body.definition;validateDefinition(d);await t.query('UPDATE app_versions SET definition=$1,revision=revision+1 WHERE id=$2',[JSON.stringify(d),draft.id]);await audit(t,s,'draft.saved','app',req.params.id,{},req.requestId);return {revision:draft.revision+1};});
+ endpoint('post','/api/apps/:id/publish',async(t,req,s)=>{if(s.role==='member')fail('Hanya admin dapat memublikasikan.',403);const {a,v,draft}=await appData(t,s,req.params.id);if(!draft||draft.revision!==req.body.revision)fail('Draft telah berubah. Simpan dan muat ulang.',409);const d=draft.definition;validateDefinition(d);if(!d.entities.length)fail('Tambahkan minimal satu entitas.');if(v)checkCompatible(v.definition,d);
+  const rows=(await t.query('SELECT * FROM records WHERE app_id=$1 AND deleted_at IS NULL',[a.id])).rows;
+  for(const row of rows){const entity=d.entities.find(e=>e.key===row.entity_key);if(!entity)fail('Entitas berisi data tidak dapat dihapus.');const next={...row.data};for(const f of entity.fields){if(f.type==='reference'){if(f.required&&!await qrow(t,'SELECT 1 FROM record_links WHERE source_record_id=$1 AND field_key=$2',[row.id,f.key]))fail(`Record lama belum memiliki ${f.label}.`);}else if((next[f.key]===undefined||next[f.key]===null||next[f.key]==='')&&f.required){if(f.default===undefined||f.default===''||f.default===null)fail(`Required field ${f.label} membutuhkan default.`);next[f.key]=f.default;}else if(next[f.key]===undefined&&f.default!==undefined)next[f.key]=f.default;}
+   const links=(await t.query('SELECT field_key,target_record_id FROM record_links WHERE source_record_id=$1',[row.id])).rows;
+   const writable=Object.fromEntries(Object.entries(next).filter(([key])=>!entity.fields.find(f=>f.key===key)?.systemManaged));
+   await validate(t,s,{...d,_appId:a.id},row.entity_key,writable,Object.fromEntries(links.map(l=>[l.field_key,l.target_record_id])),next);
+   if(JSON.stringify(next)!==JSON.stringify(row.data))await t.query('UPDATE records SET data=$1,revision=revision+1,updated_at=now(),updated_by=$2 WHERE id=$3',[JSON.stringify(next),s.userId,row.id]);
+  }
+  for(const w of d.workflows||[])if(w.enabled)await member(t,s,w.assigneeId);
+  await t.query("UPDATE app_versions SET status='published',published_at=now() WHERE id=$1",[draft.id]);await t.query('UPDATE apps SET current_version_id=$1 WHERE id=$2',[draft.id,a.id]);
+  await t.query('INSERT INTO app_versions(tenant_id,app_id,version_no,created_by,definition) VALUES ($1,$2,$3,$4,$5)',[s.tenantId,a.id,draft.version_no+1,s.userId,JSON.stringify(d)]);
+  await audit(t,s,'app.published','app',a.id,{version:draft.version_no},req.requestId);return {version:draft.version_no};
+ });
+ endpoint('post','/api/apps/:id/records',async(t,req,s)=>{const {a,v}=await appData(t,s,req.params.id);if(!v)fail('Publikasikan aplikasi terlebih dahulu.');const entity=req.body.entity;if(!scope(s,v.definition,entity,'create'))fail('Tidak memiliki izin membuat record.',403);const ownerId=s.role==='member'?s.userId:(req.body.ownerId||s.userId);await member(t,s,ownerId);const {clean,refs}=await validate(t,s,{...v.definition,_appId:a.id},entity,req.body.data||{},req.body.references||{});const id=randomUUID();await t.query('INSERT INTO records(tenant_id,id,app_id,schema_version_id,entity_key,data,owner_id,created_by,updated_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)',[s.tenantId,id,a.id,v.id,entity,JSON.stringify(clean),ownerId,s.userId]);await saveLinks(t,s,a.id,id,refs);await audit(t,s,'record.created','record',id,{entity},req.requestId);return {id};});
+ endpoint('patch','/api/records/:id',async(t,req,s)=>{const {a,v,r}=await loadRecord(t,s,req.params.id,'update');if(r.revision!==req.body.revision)fail('Record berubah. Muat ulang agar perubahan tidak tertimpa.',409);const oldRefs=(await t.query('SELECT field_key,target_record_id FROM record_links WHERE source_record_id=$1',[r.id])).rows;const data={...r.data,...req.body.data};for(const f of v.definition.entities.find(e=>e.key===r.entity_key).fields)if(f.systemManaged){if(req.body.data?.[f.key]!==undefined)fail(`${f.label} hanya diubah workflow.`);delete data[f.key];}
+  const refs={...Object.fromEntries(oldRefs.map(l=>[l.field_key,l.target_record_id])),...(req.body.references||{})};const clean=await validate(t,s,{...v.definition,_appId:a.id},r.entity_key,data,refs,r.data);const ownerId=s.role==='member'?r.owner_id:(req.body.ownerId||r.owner_id);if(s.role==='member'&&req.body.ownerId&&req.body.ownerId!==r.owner_id)fail('Hanya admin dapat mengganti owner.',403);await member(t,s,ownerId);
+  await t.query('UPDATE records SET data=$1,owner_id=$2,revision=revision+1,updated_at=now(),updated_by=$3,schema_version_id=$4 WHERE id=$5',[JSON.stringify(clean.clean),ownerId,s.userId,v.id,r.id]);await saveLinks(t,s,a.id,r.id,clean.refs);await audit(t,s,'record.updated','record',r.id,{},req.requestId);return {id:r.id};});
+ endpoint('delete','/api/records/:id',async(t,req,s)=>{const {r}=await loadRecord(t,s,req.params.id,'delete');if(r.revision!==req.body.revision)fail('Record berubah. Muat ulang.',409);if(await qrow(t,`SELECT 1 FROM record_links l JOIN records r ON r.tenant_id=l.tenant_id AND r.id=l.source_record_id WHERE l.target_record_id=$1 AND r.deleted_at IS NULL LIMIT 1`,[r.id]))fail('Record masih direferensikan. Lepaskan relasi terlebih dahulu.',409);if(await qrow(t,"SELECT 1 FROM workflow_runs WHERE record_id=$1 AND status IN ('queued','running','waiting_approval')",[r.id]))fail('Workflow aktif harus diselesaikan terlebih dahulu.',409);await t.query('UPDATE records SET deleted_at=now(),revision=revision+1 WHERE id=$1',[r.id]);await audit(t,s,'record.deleted','record',r.id,{},req.requestId);return {ok:true};});
+ endpoint('post','/api/records/:id/submit',async(t,req,s)=>{const {a,v,r}=await loadRecord(t,s,req.params.id,'update');const workflow=v.definition.workflows.find(w=>w.entity===r.entity_key&&w.enabled);if(!workflow)fail('Workflow aktif tidak tersedia.');const trigger=req.get('idempotency-key');if(!trigger||trigger.length>100)fail('Idempotency-Key wajib.');const existing=await qrow(t,'SELECT * FROM workflow_runs WHERE app_id=$1 AND trigger_key=$2',[a.id,trigger]);if(existing){if(existing.record_id!==r.id)fail('Idempotency key digunakan record lain.',409);return {id:existing.id};}
+  if(await qrow(t,"SELECT 1 FROM workflow_runs WHERE record_id=$1 AND workflow_key=$2 AND status IN ('queued','running','waiting_approval')",[r.id,workflow.key]))fail('Persetujuan record ini masih berjalan.',409);
+  const m=await member(t,s,workflow.assigneeId);if(!can({userId:m.user_id,role:m.role},v.definition,r,'read'))fail('Approver tidak memiliki akses baca record.');
+  if(r.revision!==req.body.revision)fail('Record berubah. Muat ulang.',409);const next={...r.data,discount_status:'pending'};await t.query('UPDATE records SET data=$1,revision=revision+1,updated_at=now(),updated_by=$2 WHERE id=$3',[JSON.stringify(next),s.userId,r.id]);
+  const id=randomUUID(),context={snapshot:next,expectedRevision:r.revision+1,workflow};await t.query('INSERT INTO workflow_runs(tenant_id,id,app_id,record_id,app_version_id,workflow_key,trigger_key,started_by,context) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',[s.tenantId,id,a.id,r.id,v.id,workflow.key,trigger,s.userId,JSON.stringify(context)]);await t.query('INSERT INTO outbox_events(tenant_id,event_key,type,payload) VALUES ($1,$2,$3,$4)',[s.tenantId,'start:'+id,'workflow.start',JSON.stringify({runId:id})]);await audit(t,s,'workflow.submitted','record',r.id,{},req.requestId);return {id};});
+ endpoint('post','/api/approvals/:id/decision',async(t,req,s)=>{const task=await qrow(t,'SELECT * FROM approval_tasks WHERE id=$1 FOR UPDATE',[req.params.id]);if(!task||task.assignee_id!==s.userId)fail('Tugas tidak ditemukan.',404);if(task.status!=='pending')fail('Tugas sudah diputuskan.',409);const decision=req.body.decision;if(!['approved','rejected'].includes(decision))fail('Keputusan tidak valid.');if(decision==='rejected'&&!String(req.body.note||'').trim())fail('Alasan penolakan wajib diisi.');const run=await qrow(t,'SELECT * FROM workflow_runs WHERE id=$1 FOR UPDATE',[task.run_id]);await loadRecord(t,s,run.record_id);
+  await t.query('UPDATE approval_tasks SET status=$1,decision_note=$2,decided_by=$3,decided_at=now() WHERE id=$4',[decision,String(req.body.note||'').slice(0,1000),s.userId,task.id]);await t.query('UPDATE workflow_runs SET context=context || $1::jsonb,updated_at=now() WHERE id=$2',[JSON.stringify({decision}),run.id]);await t.query('INSERT INTO outbox_events(tenant_id,event_key,type,payload) VALUES ($1,$2,$3,$4)',[s.tenantId,'resume:'+run.id,'workflow.resume',JSON.stringify({runId:run.id})]);await audit(t,s,'approval.'+decision,'approval',task.id,{},req.requestId);return {ok:true};});
+ endpoint('post','/api/approvals/:id/reassign',async(t,req,s)=>{if(s.role==='member')fail('Hanya admin dapat memindahkan tugas.',403);const task=await qrow(t,"SELECT * FROM approval_tasks WHERE id=$1 AND status='pending' FOR UPDATE",[req.params.id]);if(!task)fail('Tugas aktif tidak ditemukan.',404);const m=await member(t,s,req.body.assigneeId);const run=await qrow(t,'SELECT * FROM workflow_runs WHERE id=$1',[task.run_id]);const {r,v}=await loadRecord(t,s,run.record_id);if(!can({role:m.role,userId:m.user_id},v.definition,r,'read'))fail('Penerima tidak memiliki akses baca.');await t.query('UPDATE approval_tasks SET assignee_id=$1 WHERE id=$2',[m.user_id,task.id]);await notify(t,s,m.user_id,'approval',{runId:run.id,recordId:r.id,title:r.data.name},'reassign:'+task.id+':'+randomUUID());await audit(t,s,'approval.reassigned','approval',task.id,{},req.requestId);return {ok:true};});
+ endpoint('post','/api/notifications/read',async(t,req,s)=>{await t.query('UPDATE notifications SET read_at=now() WHERE read_at IS NULL');return {ok:true};});
+
+ async function processEvents(){return serial(async()=>{for(const tenantId of [uid(1),uid(2)])await tx({tenantId,userId:uid(3),role:'owner'},async t=>{
+  const events=(await t.query("SELECT * FROM outbox_events WHERE status='pending' AND available_at<=now() ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED")).rows;
+  for(const event of events){await t.exec('SAVEPOINT event_attempt');try{const run=await qrow(t,'SELECT * FROM workflow_runs WHERE id=$1 FOR UPDATE',[event.payload.runId]);if(!run||['completed','conflict','failed','canceled'].includes(run.status)){await t.query("UPDATE outbox_events SET status='done' WHERE id=$1",[event.id]);continue;}
+   const s={tenantId,userId:run.started_by,role:'owner'};const r=await qrow(t,'SELECT * FROM records WHERE id=$1 AND deleted_at IS NULL',[run.record_id]);if(!r){await t.query("UPDATE workflow_runs SET status='failed',error_code='RECORD_MISSING' WHERE id=$1",[run.id]);await t.query("UPDATE outbox_events SET status='dead',last_error='Record missing' WHERE id=$1",[event.id]);continue;}
+   const w=run.context.workflow;
+   if(r.revision!==run.context.expectedRevision){await t.query("UPDATE workflow_runs SET status='conflict',error_code='REVISION_CONFLICT',updated_at=now() WHERE id=$1",[run.id]);await notify(t,s,r.owner_id,'conflict',{title:r.data.name,recordId:r.id,runId:run.id},'conflict:'+run.id);await audit(t,s,'workflow.conflict','record',r.id);}
+   else if(event.type==='workflow.start'&&Number(run.context.snapshot.discount_percent||0)>Number(w.threshold)){
+    const m=await qrow(t,"SELECT * FROM memberships WHERE user_id=$1 AND status='active'",[w.assigneeId]);const {v}=await appData(t,{...s,role:'owner'},r.app_id);if(!m||!can({role:m.role,userId:m.user_id},v.definition,r,'read')){await t.query("UPDATE workflow_runs SET status='failed',error_code='APPROVER_INACTIVE' WHERE id=$1",[run.id]);}else{await t.query('INSERT INTO approval_tasks(tenant_id,run_id,node_key,assignee_id) VALUES ($1,$2,$3,$4) ON CONFLICT(tenant_id,run_id,node_key) DO NOTHING',[tenantId,run.id,'manager',w.assigneeId]);await t.query("UPDATE workflow_runs SET status='waiting_approval',cursor='manager',updated_at=now() WHERE id=$1",[run.id]);await notify(t,s,w.assigneeId,'approval',{title:r.data.name,recordId:r.id,runId:run.id},'approval:'+run.id);await audit(t,s,'approval.requested','record',r.id);}
+   }else{const value=run.context.decision||'approved';const next={...r.data,discount_status:value};await t.query('UPDATE records SET data=$1,revision=revision+1,updated_at=now() WHERE id=$2',[JSON.stringify(next),r.id]);await t.query("UPDATE workflow_runs SET status='completed',cursor='end',updated_at=now() WHERE id=$1",[run.id]);await notify(t,s,r.owner_id,'result',{title:r.data.name,recordId:r.id,result:value,runId:run.id},'result:'+run.id);await audit(t,s,'workflow.'+value,'record',r.id);}
+   await t.query("UPDATE outbox_events SET status='done',attempts=attempts+1 WHERE id=$1",[event.id]);
+   }catch(error){await t.exec('ROLLBACK TO SAVEPOINT event_attempt');const attempts=event.attempts+1;const dead=attempts>=5;const delay=Math.min(300,5*2**(attempts-1))+Math.random();await t.query("UPDATE outbox_events SET status=$1,attempts=$2,last_error=$3,available_at=now()+($4*interval '1 second') WHERE id=$5",[dead?'dead':'pending',attempts,error.code||'WORKER_ERROR',delay,event.id]);if(dead){await t.query("UPDATE workflow_runs SET status='failed',error_code='WORKER_RETRY_EXHAUSTED',updated_at=now() WHERE id=$1",[event.payload.runId]);await audit(t,{tenantId,userId:uid(3)},'workflow.failed','workflow',event.payload.runId,{errorCode:error.code||'WORKER_ERROR'});}}
+   finally{await t.exec('RELEASE SAVEPOINT event_attempt');}
+  }
+ });});}
+ let tickPending=false;const timer=setInterval(()=>{if(tickPending)return;tickPending=true;processEvents().catch(e=>console.error('Worker',e.code||e.message)).finally(()=>{tickPending=false;});},500);timer.unref();
+ app.use(express.static(path.join(root,'dist')));
+ app.get('/{*splat}',(req,res)=>{if(req.path.startsWith('/api/'))return res.status(404).json({message:'Endpoint tidak ditemukan.'});res.sendFile(path.join(root,'dist/index.html'));});
+ app.use((err,req,res,next)=>{console.error(req.requestId,err.message);const status=err.status||(err.code==='23505'?409:err.type==='entity.too.large'?413:500);res.status(status).json({code:status===500?'INTERNAL_ERROR':'REQUEST_ERROR',message:status===500?'Permintaan gagal. Coba lagi atau muat ulang.':err.message,requestId:req.requestId});});
+ return {app,db,processEvents,close:async()=>{clearInterval(timer);await queue;await db.close();}};
+}
+
+function validateDefinition(d){
+ if(!d||d.schemaFormat!==1||!Array.isArray(d.entities)||!Array.isArray(d.forms)||!Array.isArray(d.permissions)||!Array.isArray(d.workflows)||JSON.stringify(d).length>1000000)fail('Metadata aplikasi tidak valid.');if(d.entities.length>10)fail('Maksimum 10 entitas per aplikasi.');const keys=new Set();
+ for(const e of d.entities){if(!keyPattern.test(e.key)||keys.has(e.key)||!e.label||!Array.isArray(e.fields)||e.fields.length>50)fail('Key entitas unik, label dan maksimal 50 field wajib.');keys.add(e.key);const fkeys=new Set();if(e.fields.filter(f=>f.searchable).length>5)fail('Maksimum lima field searchable.');for(const f of e.fields){if(!keyPattern.test(f.key)||fkeys.has(f.key)||!f.label||!['text','long_text','integer','decimal','boolean','date','datetime','enum','email','reference'].includes(f.type))fail('Definisi field tidak valid atau key duplikat.');fkeys.add(f.key);if(f.type==='enum'&&(!Array.isArray(f.options)||!f.options.length||f.options.some(o=>typeof o!=='string')))fail('Enum membutuhkan pilihan teks.');if(f.min!=null&&(!Number.isFinite(Number(f.min))))fail('Nilai minimum tidak valid.');if(f.max!=null&&(!Number.isFinite(Number(f.max))))fail('Nilai maksimum tidak valid.');if(f.min!=null&&f.max!=null&&Number(f.min)>Number(f.max))fail('Minimum melebihi maksimum.');}}
+ for(const e of d.entities)for(const f of e.fields)if(f.type==='reference'&&!keys.has(f.targetEntity))fail(`Target relasi ${f.label} tidak ditemukan.`);
+ for(const form of d.forms){const e=d.entities.find(e=>e.key===form.entity);if(!e||![1,2].includes(form.columns)||!Array.isArray(form.fields)||new Set(form.fields).size!==form.fields.length||form.fields.some(k=>!e.fields.some(f=>f.key===k)))fail('Form memiliki field yang tidak valid.');}
+ for(const e of d.entities){const form=d.forms.find(f=>f.entity===e.key);if(!form)fail('Setiap entitas membutuhkan form.');for(const f of e.fields)if(f.required&&!f.systemManaged&&!form.fields.includes(f.key)&&(f.type==='reference'||f.default===undefined||f.default===null||f.default===''))fail(`Required field ${f.label} harus tampil di form atau memiliki default.`);}
+ if(!Array.isArray(d.views))fail('Definisi list tidak valid.');for(const v of d.views){const e=d.entities.find(e=>e.key===v.entity);if(!e||!Array.isArray(v.columns)||!v.columns.length||new Set(v.columns).size!==v.columns.length||v.columns.some(k=>!e.fields.some(f=>f.key===k))||(v.sort&&(!e.fields.some(f=>f.key===v.sort.field&&f.type!=='reference')||!['asc','desc'].includes(v.sort.direction))))fail('List memiliki kolom tidak valid.');}
+ if(d.workflows.length>1)fail('MVP mendukung satu template workflow per aplikasi.');
+ for(const p of d.permissions){if(p.role!=='member'||!keys.has(p.entity)||!['none','own','all'].includes(p.read)||!['none','own','all'].includes(p.update)||!['none','own','all'].includes(p.delete)||typeof p.create!=='boolean')fail('Permission tidak valid.');const rank={none:0,own:1,all:2};if(rank[p.update]>rank[p.read]||rank[p.delete]>rank[p.read])fail('Akses ubah/hapus tidak boleh melebihi baca.');}
+ for(const w of d.workflows){if(w.entity!=='opportunity'||w.key!=='discount_approval'||!Number.isFinite(Number(w.threshold))||Number(w.threshold)<0||Number(w.threshold)>100||!w.assigneeId)fail('MVP mendukung template persetujuan diskon, threshold 0–100.');const e=d.entities.find(e=>e.key==='opportunity');if(!e?.fields.some(f=>f.key==='discount_percent')||!e?.fields.some(f=>f.key==='discount_status'&&f.systemManaged))fail('Workflow membutuhkan field diskon dan status sistem.');}
+}
+function checkCompatible(old,next){for(const e of old.entities){const n=next.entities.find(n=>n.key===e.key);if(!n)fail('Entitas terbit tidak dapat dihapus pada MVP.');for(const f of e.fields){const nf=n.fields.find(nf=>nf.key===f.key);if(!nf||nf.type!==f.type||nf.targetEntity!==f.targetEntity||nf.systemManaged!==f.systemManaged)fail(`Field ${f.label} tidak dapat dihapus atau diubah tipe/otoritasnya.`);}}}
+
+async function seedDemo(db){
+ await db.query('INSERT INTO tenants(id,name,slug) VALUES ($1,$2,$3),($4,$5,$6)',[uid(1),'Nusantara Digital','nusantara',uid(2),'Atlas Workspace','atlas']);
+ for(const p of personas)await db.query('INSERT INTO users(id,auth_subject,email,display_name) VALUES ($1,$2,$3,$4)',[p.id,'demo:'+p.id,p.name.split(' ')[0].toLowerCase()+'@example.invalid',p.name]);
+ for(const tenantId of [uid(1),uid(2)])for(const p of personas)await db.query('INSERT INTO memberships(tenant_id,user_id,role) VALUES ($1,$2,$3)',[tenantId,p.id,p.role]);
+ for(const [i,tenantId]of [uid(1),uid(2)].entries()){
+ const appId=uid(10+i),vId=uid(20+i),d=template();await db.query('INSERT INTO apps(tenant_id,id,key,name) VALUES ($1,$2,$3,$4)',[tenantId,appId,'crm','Sales CRM']);await db.query("INSERT INTO app_versions(tenant_id,id,app_id,version_no,status,created_by,definition,published_at) VALUES ($1,$2,$3,1,'published',$4,$5,now())",[tenantId,vId,appId,uid(3),JSON.stringify(d)]);await db.query('UPDATE apps SET current_version_id=$1 WHERE id=$2',[vId,appId]);await db.query('INSERT INTO app_versions(tenant_id,app_id,version_no,created_by,definition) VALUES ($1,$2,2,$3,$4)',[tenantId,appId,uid(3),JSON.stringify(d)]);
+ const add=async(entity,data,owner=uid(5),days=0)=>{const id=randomUUID();await db.query("INSERT INTO records(tenant_id,id,app_id,schema_version_id,entity_key,data,owner_id,created_by,updated_by,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$7,now()-($8 * interval '1 day'),now()-($8 * interval '1 day'))",[tenantId,id,appId,vId,entity,JSON.stringify(data),owner,days]);return id;};
+ const names=i?['Atlas Karya','Orbit Studio','Sentra Logistik']:['Sagara Teknologi','Arunika Retail','Cakra Manufaktur','Meridian Health','Kirana Creative'];const accounts=[];
+ for(const [j,name]of names.entries())accounts.push(await add('account',{name,industry:['Teknologi','Retail','Manufaktur','Kesehatan','Jasa'][j%5],website:''},uid(5),j+2));
+ const opps=i?[['Sistem operasional Atlas',180000000,'proposal',12],['CRM Orbit Studio',75000000,'qualification',5]]:[['ERP terintegrasi Sagara',245000000,'negotiation',15],['Ekspansi digital Arunika',180000000,'proposal',8],['Otomasi pabrik Cakra',320000000,'qualification',12],['Portal pasien Meridian',125000000,'proposal',5],['CRM tim Kirana',85000000,'won',7],['Layanan cloud Sagara',95000000,'negotiation',18],['Retail analytics Arunika',160000000,'qualification',0],['Maintenance Cakra',60000000,'lost',0]];
+ let pendingRecord;
+ for(const [j,[name,amount,stage,discount]]of opps.entries()){const id=await add('opportunity',{name,amount:String(amount),currency:'IDR',stage,close_date:'2026-12-'+String(5+j*3).padStart(2,'0'),discount_percent:String(discount),discount_status:j===0?'pending':'none'},j%3===0?uid(3):uid(5),j+1);await db.query('INSERT INTO record_links VALUES ($1,$2,$3,$4,$5)',[tenantId,appId,id,'account',accounts[j%accounts.length]]);if(j===0)pendingRecord=id;}
+ for(const [j,name]of ['Aditya Wijaya','Nadia Kusuma','Bagas Prakoso','Dina Amelia','Kevin Santoso','Laras Wulandari'].entries()){await add('lead',{name,email:name.toLowerCase().replace(' ','.')+'@example.invalid',company:names[j%names.length],source:['Website','Referral','Event','Outbound'][j%4],status:j%3?'new':'qualified'},j%2?uid(3):uid(5),j+1);if(j<4){const id=await add('contact',{name,email:name.toLowerCase().replace(' ','.')+'@example.invalid',phone:'0812 0000 '+(1000+j)},uid(5),j+1);await db.query('INSERT INTO record_links VALUES ($1,$2,$3,$4,$5)',[tenantId,appId,id,'account',accounts[j%accounts.length]]);}}
+ const rec=(await db.query('SELECT * FROM records WHERE id=$1',[pendingRecord])).rows[0];const runId=randomUUID();await db.query("INSERT INTO workflow_runs(tenant_id,id,app_id,record_id,app_version_id,workflow_key,trigger_key,started_by,status,cursor,context) VALUES ($1,$2,$3,$4,$5,'discount_approval',$6,$7,'waiting_approval','manager',$8)",[tenantId,runId,appId,pendingRecord,vId,'seed:'+runId,uid(3),JSON.stringify({snapshot:rec.data,expectedRevision:1,workflow:d.workflows[0]})]);await db.query("INSERT INTO approval_tasks(tenant_id,run_id,node_key,assignee_id) VALUES ($1,$2,'manager',$3)",[tenantId,runId,uid(4)]);await db.query("INSERT INTO notifications(tenant_id,recipient_id,type,payload,dedupe_key) VALUES ($1,$2,'approval',$3,$4)",[tenantId,uid(4),JSON.stringify({title:rec.data.name,recordId:pendingRecord,runId}), 'approval:'+runId]);for(const [j,action]of ['app.published','record.created','workflow.submitted','approval.requested'].entries())await db.query("INSERT INTO audit_events(tenant_id,actor_id,action,resource_type,resource_id,request_id,created_at) VALUES ($1,$2,$3,'app',$4,$5,now()-($6*interval '15 minute'))",[tenantId,uid(3),action,appId,'seed:'+j,4-j]);
+ }
+}
+if(process.argv[1]===fileURLToPath(import.meta.url)){if(process.env.DEMO_MODE==='false')throw Error('Mode produksi belum tersedia: implementasikan autentikasi OIDC sebelum menonaktifkan demo.');const server=await createServer();const http=server.app.listen(3000,'0.0.0.0',()=>console.log('Flowbase DEMO ready on port 3000'));let stopping=false;const shutdown=()=>{if(stopping)return;stopping=true;http.close(async()=>{await server.close();process.exit(0);});};process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);}
